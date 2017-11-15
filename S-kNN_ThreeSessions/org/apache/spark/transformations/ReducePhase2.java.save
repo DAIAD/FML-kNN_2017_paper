@@ -1,0 +1,948 @@
+package org.apache.spark.transformations;
+
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.FileReader;
+import java.io.BufferedReader;
+import java.util.Collections;
+import java.util.Comparator;
+
+import org.apache.spark.api.java.function.FlatMapFunction;
+import org.apache.spark.tools.ExecConf;
+import org.apache.spark.tools.Zorder;
+import org.apache.spark.values.KnnRecord;
+import org.apache.spark.values.Phase1_2Value;
+
+import scala.Tuple2;
+import scala.Tuple4;
+
+import com.mellowtech.collections.BPlusTree;
+import com.mellowtech.collections.KeyValue;
+import com.mellowtech.disc.CBString;
+
+public class ReducePhase2 implements FlatMapFunction<Iterator<Tuple2<Integer,Iterable<Phase1_2Value>>>, Tuple4<String, String, String, String>> {
+
+		private static final long serialVersionUID = 1L;
+		private int zOffset, ridOffset, srcOffset, sidOffset, classOffset, sid=0;
+		private ExecConf conf;
+
+		public ReducePhase2(ExecConf conf) {
+                	this.conf = conf;
+        	}
+
+		@Override
+		public Iterable<Tuple4<String, String, String, String>> call(
+				Iterator<Tuple2<Integer, Iterable<Phase1_2Value>>> arg0) throws Exception {
+
+			LinkedList<Tuple4<String, String, String, String>> result = new LinkedList<Tuple4<String, String, String, String>>();
+			Iterator<Tuple2<Integer, Iterable<Phase1_2Value>>> iterator = arg0;
+			Tuple2<Integer, Iterable<Phase1_2Value>> input = iterator.next();
+			Iterator<Phase1_2Value> iterator_input = input._2().iterator();
+			Phase1_2Value entry = iterator_input.next();
+
+			String outerTable = "/home/local/chgeorgakidis/S-kNN/Spark_zkNN_3Ph/R_local/R_local" + entry.getFourth();
+			String innerTable = "/home/local/chgeorgakidis/S-kNN/Spark_zkNN_3Ph/S_local/S_local" + entry.getFourth();
+
+			zOffset = 0;
+			ridOffset = zOffset + 1;
+			srcOffset = ridOffset + 1;
+			sidOffset = srcOffset + 1;
+			classOffset = sidOffset + 1;
+
+			String line = entry.toString();
+	                String[] parts = line.split(" +");
+			if (Integer.parseInt(parts[sidOffset]) >= conf.getNumOfPartition()) sid = 1;
+
+			// Create seperate local files for different key value
+			FileWriter writerR = new FileWriter(outerTable);
+			FileWriter writerS = new FileWriter(innerTable);
+			List<String> Rlist = new ArrayList<String>();
+			List<String> Slist = new ArrayList<String>();
+
+			// value format <zvalue, rid, src>
+			while (iterator_input.hasNext()) {
+
+				String line = entry.toString();
+
+				String[] parts = line.split(" +");
+				String zvalue = parts[zOffset];
+				String rid = parts[ridOffset];
+				String src = parts[srcOffset];
+				int srcId = Integer.valueOf(src);
+				String demandclass = parts[classOffset];
+
+				String tmpRecord = zvalue + " " + rid + ":" + demandclass + "\n";
+
+				if (srcId == 0)  // from R
+					Rlist.add(tmpRecord);
+					//writerR.write(tmpRecord);
+				else if (srcId == 1) // from S
+					Slist.add(tmpRecord);
+					//writerS.write(tmpRecord);
+				else {
+					System.out.println(srcId);
+					System.out.println("The record has an unknown source!!");
+					System.exit(-1);
+				}
+
+				entry = iterator_input.next();
+			}
+
+			ValueComparator com = new ValueComparator();
+			Collections.sort(Slist, com);
+			Collections.sort(Rlist, com);
+
+			for (String s : Rlist) {
+				writerR.write(s);
+			}
+			for (String s : Slist) {
+				writerS.write(s);
+			}
+
+			writerR.close();
+			writerS.close();
+
+			// Check if the created files are larger than 3GB
+			File R = new File("R_local/R_local" + entry.getFourth());
+			File S = new File("S_local/S_local" + entry.getFourth());
+			double Rmegabytes = 0;
+			double Smegabytes = 0;
+
+			if(R.exists() && S.exists()){
+				double Rbytes = R.length();
+				double Sbytes = S.length();
+				Rmegabytes = ((Rbytes / 1024)/ 1024);
+				Smegabytes = ((Sbytes / 1024)/ 1024);
+			}else{
+				 System.out.println("File does not exist!");
+			}
+
+		/****** Perform binary search for each R over the S ********/
+		// If the datasets fit in memory, proceed with binary search...
+		if ((Rmegabytes < 1000) && (Smegabytes < 1000)) {
+
+			// Calculate the kNN on the z-values, unshift where necessary,
+			// calculate distances and collect
+			// in the following format: <rid, sid, d(r,s)>
+			// key type and value type for B+ tree
+			CBString keyType = new CBString();
+			CBString valueType = new CBString();
+			int indexBlockSize = 1024 * 32; // 4k size
+			int valueBlockSize = 1024 * 32;
+			int bufInLength = 8 * 1024 * 1024;
+
+			BPlusTree bpt = new BPlusTree(innerTable, keyType, valueType, valueBlockSize, indexBlockSize);
+			bpt.setTreeCache(32 * 1024 * 1024, 32 * 1024 * 1024);
+
+			int flag = 0; // 0 for CBString, CBInt
+			bpt.createIndexBL(innerTable, bufInLength, flag);
+			bpt.save();
+
+			float hashTableLoadFactor = 0.75f;
+			final int knnFactor = 4;
+
+			int hashTableCapacity = (int) Math.ceil((knnFactor * conf.getKnn())/ hashTableLoadFactor) + 1;
+
+			LinkedHashMap<String, ArrayList<Integer>> coordLRUCache = new LinkedHashMap<String, ArrayList<Integer>>(hashTableCapacity, hashTableLoadFactor, true) {
+				private static final long serialVersionUID = 1L;
+				@Override
+				protected boolean removeEldestEntry(
+						Map.Entry<String, ArrayList<Integer>> eldest) {
+					return size() > knnFactor * conf.getKnn();
+				}
+			};
+
+			FileReader frForR = new FileReader(outerTable);
+			BufferedReader brForR = new BufferedReader(frForR, bufInLength);
+
+			boolean loop = true;
+			while (loop) {
+				line = brForR.readLine();
+				if (line == null) break;
+
+				parts = line.split(" +");
+				String zval = parts[0];
+				rid = parts[1];
+				//String demandClass = parts[2];
+				int[] coord = Zorder.toCoord(zval, conf.getDimension());
+
+				// Unshift
+                                if (sid != 0) {
+                                        for (int i=0; i<conf.getDimension(); i++)
+                                                coord[i] = coord[i] - conf.getShiftvectors()[sid][i];
+                                }
+
+				ArrayList<ArrayList<KeyValue>> knnList = bpt.rangeSearch(new CBString(zval), conf.getKnn());
+
+				ArrayList<KnnRecord> knnListSorted = new ArrayList<KnnRecord>();
+				Comparator<KnnRecord> krc = new KnnRecordComparator();
+				for (ArrayList<KeyValue> l : knnList) {
+					for (KeyValue e : l) {
+
+						String zval2 = ((CBString) e.getKey()).getString();
+						String rid2 = ((CBString) e.getValue()).getString();
+						int[] coord2 = null;
+
+						ArrayList<Integer> cachedCoord2 = coordLRUCache.get(zval2);
+
+						if (cachedCoord2 == null) {
+							coord2 = Zorder.toCoord(zval2, conf.getDimension());
+
+							Last login: Fri Feb 12 11:21:39 on ttys000
+Georgioss-MacBook-Pro:~ whashnez$ ssh chgeorgakidis@helios.uop.gr
+Password: 
+Last login: Fri Feb 12 11:41:50 2016 from 85.75.56.129
+Sun Microsystems Inc.   SunOS 5.10      Generic January 2005
+Sun Microsystems Inc.   SunOS 5.10      Generic January 2005
+You have mail.
+tcsh: using dumb terminal settings.
+> ssh chgeorgakidis@hydra-6.dit.uop.gr
+Linux hydra-6 3.2.0-4-amd64 #1 SMP Debian 3.2.73-2+deb7u2 x86_64
+
+The programs included with the Debian GNU/Linux system are free software;
+the exact distribution terms for each program are described in the
+individual files in /usr/share/doc/*/copyright.
+
+Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent
+permitted by applicable law.
+Last login: Fri Feb 12 11:17:55 2016 from helios.uop.gr
+hydra-6:~> cd Files/F-kNN/FML_kNN/
+hydra-6:~/Files/F-kNN/FML_kNN> nano src 
+collections.jar  com/             datasets/        disc.jar         guava-18.0.jar*  pom.xml*         R*               randomVectors*   R_local/         S*               se/              S_local/         src/             target/          util.jar*        
+hydra-6:~/Files/F-kNN/FML_kNN> nano src 
+collections.jar  com/             datasets/        disc.jar         guava-18.0.jar*  pom.xml*         R*               randomVectors*   R_local/         S*               se/              S_local/         src/             target/          util.jar*        
+hydra-6:~/Files/F-kNN/FML_kNN> nano src 
+collections.jar  com/             datasets/        disc.jar         guava-18.0.jar*  pom.xml*         R*               randomVectors*   R_local/         S*               se/              S_local/         src/             target/          util.jar*        
+hydra-6:~/Files/F-kNN/FML_kNN> nano src 
+collections.jar  com/             datasets/        disc.jar         guava-18.0.jar*  pom.xml*         R*               randomVectors*   R_local/         S*               se/              S_local/         src/             target/          util.jar*        
+hydra-6:~/Files/F-kNN/FML_kNN> nano src 
+collections.jar  com/             datasets/        disc.jar         guava-18.0.jar*  pom.xml*         R*               randomVectors*   R_local/         S*               se/              S_local/         src/             target/          util.jar*        
+hydra-6:~/Files/F-kNN/FML_kNN> nano src 
+collections.jar  com/             datasets/        disc.jar         guava-18.0.jar*  pom.xml*         R*               randomVectors*   R_local/         S*               se/              S_local/         src/             target/          util.jar*        
+hydra-6:~/Files/F-kNN/FML_kNN> nano src/
+assembly/ main/     test/     
+hydra-6:~/Files/F-kNN/FML_kNN> nano src/
+assembly/ main/     test/     
+hydra-6:~/Files/F-kNN/FML_kNN> nano src/
+assembly/ main/     test/     
+hydra-6:~/Files/F-kNN/FML_kNN> nano src/
+assembly/ main/     test/     
+hydra-6:~/Files/F-kNN/FML_kNN> nano src/main/java/org/apache/flink/
+mainApp/         tools/           transformations/ 
+hydra-6:~/Files/F-kNN/FML_kNN> nano src/main/java/org/apache/flink/
+mainApp/         tools/           transformations/ 
+hydra-6:~/Files/F-kNN/FML_kNN> nano src/main/java/org/apache/flink/
+mainApp/         tools/           transformations/ 
+hydra-6:~/Files/F-kNN/FML_kNN> nano src/main/java/org/apache/flink/
+mainApp/         tools/           transformations/ 
+hydra-6:~/Files/F-kNN/FML_kNN> nano src/main/java/org/apache/flink/transformations/
+MapPhase1.java*                  MapPhase2.java*                  ReducePhase1.java                ReducePhase2.java*               ReducePhase3Classification.java* ReducePhase3Regression.java      
+hydra-6:~/Files/F-kNN/FML_kNN> nano src/main/java/org/apache/flink/transformations/
+MapPhase1.java*                  MapPhase2.java*                  ReducePhase1.java                ReducePhase2.java*               ReducePhase3Classification.java* ReducePhase3Regression.java      
+hydra-6:~/Files/F-kNN/FML_kNN> nano src/main/java/org/apache/flink/transformations/Re
+ReducePhase1.java                ReducePhase2.java*               ReducePhase3Classification.java* ReducePhase3Regression.java      
+hydra-6:~/Files/F-kNN/FML_kNN> nano src/main/java/org/apache/flink/transformations/ReducePhase2.java 
+hydra-6:~/Files/F-kNN/FML_kNN> cd ../F
+Flink_kNN_3Phases/ FML_kNN/           
+hydra-6:~/Files/F-kNN/FML_kNN> cd ../Flink_kNN_3Phases/
+hydra-6:~/Files/F-kNN/Flink_kNN_3Phases> nano src/
+assembly/ main/     test/     
+hydra-6:~/Files/F-kNN/Flink_kNN_3Phases> nano src/
+assembly/ main/     test/     
+hydra-6:~/Files/F-kNN/Flink_kNN_3Phases> nano src/
+assembly/ main/     test/     
+hydra-6:~/Files/F-kNN/Flink_kNN_3Phases> nano src/
+assembly/ main/     test/     
+hydra-6:~/Files/F-kNN/Flink_kNN_3Phases> nano src/main/java/org/apache/flink/
+phases/          tools/           transformations/ values/          
+hydra-6:~/Files/F-kNN/Flink_kNN_3Phases> nano src/main/java/org/apache/flink/
+phases/          tools/           transformations/ values/          
+hydra-6:~/Files/F-kNN/Flink_kNN_3Phases> nano src/main/java/org/apache/flink/
+phases/          tools/           transformations/ values/          
+hydra-6:~/Files/F-kNN/Flink_kNN_3Phases> nano src/main/java/org/apache/flink/
+phases/          tools/           transformations/ values/          
+hydra-6:~/Files/F-kNN/Flink_kNN_3Phases> nano src/main/java/org/apache/flink/
+phases/          tools/           transformations/ values/          
+hydra-6:~/Files/F-kNN/Flink_kNN_3Phases> nano src/main/java/org/apache/flink/transformations/R
+ReducePhase1.java* ReducePhase2.java* ReducePhase3.java* 
+hydra-6:~/Files/F-kNN/Flink_kNN_3Phases> nano src/main/java/org/apache/flink/transformations/ReducePhase2.java 
+hydra-6:~/Files/F-kNN/Flink_kNN_3Phases> mvn clean package
+[INFO] Scanning for projects...
+[WARNING] 
+[WARNING] Some problems were encountered while building the effective model for flink:Flink_kNN_3Phases:jar:0.1
+[WARNING] 'dependencies.dependency.systemPath' for com.mellowtech:disc:jar should not point at files within the project directory, ${project.basedir}/disc.jar will be unresolvable by dependent projects @ line 72, column 20
+[WARNING] 'dependencies.dependency.systemPath' for com.mellowtech:collections:jar should not point at files within the project directory, ${project.basedir}/collections.jar will be unresolvable by dependent projects @ line 79, column 37
+[WARNING] 'dependencies.dependency.systemPath' for se.sics:util:jar should not point at files within the project directory, ${project.basedir}/util.jar will be unresolvable by dependent projects @ line 86, column 37
+[WARNING] 
+[WARNING] It is highly recommended to fix these problems because they threaten the stability of your build.
+[WARNING] 
+[WARNING] For this reason, future Maven versions might no longer support building such malformed projects.
+[WARNING] 
+[INFO]                                                                         
+[INFO] ------------------------------------------------------------------------
+[INFO] Building Your Job's Name 0.1
+[INFO] ------------------------------------------------------------------------
+[INFO] 
+[INFO] --- maven-clean-plugin:2.3:clean (default-clean) @ Flink_kNN_3Phases ---
+[INFO] Deleting file set: /home/local/chgeorgakidis/F-kNN/Flink_kNN_3Phases/target (included: [**], excluded: [])
+[INFO] 
+[INFO] --- maven-resources-plugin:2.3:resources (default-resources) @ Flink_kNN_3Phases ---
+[INFO] Using 'UTF-8' encoding to copy filtered resources.
+[INFO] skip non existing resourceDirectory /home/local/chgeorgakidis/F-kNN/Flink_kNN_3Phases/src/main/resources
+[INFO] 
+[INFO] --- maven-compiler-plugin:3.1:compile (default-compile) @ Flink_kNN_3Phases ---
+[INFO] Changes detected - recompiling the module!
+[INFO] Compiling 16 source files to /home/local/chgeorgakidis/F-kNN/Flink_kNN_3Phases/target/classes
+[INFO] 
+[INFO] --- maven-resources-plugin:2.3:testResources (default-testResources) @ Flink_kNN_3Phases ---
+[INFO] Using 'UTF-8' encoding to copy filtered resources.
+[INFO] skip non existing resourceDirectory /home/local/chgeorgakidis/F-kNN/Flink_kNN_3Phases/src/test/resources
+[INFO] 
+[INFO] --- maven-compiler-plugin:3.1:testCompile (default-testCompile) @ Flink_kNN_3Phases ---
+[INFO] Nothing to compile - all classes are up to date
+[INFO] 
+[INFO] --- maven-surefire-plugin:2.10:test (default-test) @ Flink_kNN_3Phases ---
+[INFO] No tests to run.
+[INFO] Surefire report directory: /home/local/chgeorgakidis/F-kNN/Flink_kNN_3Phases/target/surefire-reports
+
+-------------------------------------------------------
+ T E S T S
+-------------------------------------------------------
+
+Results :
+
+Tests run: 0, Failures: 0, Errors: 0, Skipped: 0
+
+[INFO] 
+[INFO] --- maven-jar-plugin:2.2:jar (default-jar) @ Flink_kNN_3Phases ---
+[INFO] Building jar: /home/local/chgeorgakidis/F-kNN/Flink_kNN_3Phases/target/Flink_kNN_3Phases-0.1.jar
+[INFO] 
+[INFO] --- maven-assembly-plugin:2.4.1:single (make-assembly) @ Flink_kNN_3Phases ---
+[INFO] Reading assembly descriptor: src/assembly/flink-fat-jar.xml
+[INFO] Building jar: /home/local/chgeorgakidis/F-kNN/Flink_kNN_3Phases/target/Flink_kNN_3Phases-0.1-flink-fat-jar.jar
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time: 4:50.297s
+[INFO] Finished at: Fri Feb 12 12:23:21 EET 2016
+[INFO] Final Memory: 32M/1941M
+[INFO] ------------------------------------------------------------------------
+hydra-6:~/Files/F-kNN/Flink_kNN_3Phases> jar uf target/F
+Flink_kNN_3Phases-0.1-flink-fat-jar.jar  Flink_kNN_3Phases-0.1.jar                
+hydra-6:~/Files/F-kNN/Flink_kNN_3Phases> jar uf target/Flink_kNN_3Phases-0.1-flink-fat-jar.jar com
+hydra-6:~/Files/F-kNN/Flink_kNN_3Phases> jar uf target/Flink_kNN_3Phases-0.1-flink-fat-jar.jar se
+hydra-6:~/Files/F-kNN/Flink_kNN_3Phases>  ../../Frameworks/flink-yarn-0.8.1/bin/flink run -p 16 --class org.apache.flink.phases.Phase1 target/Flink_kNN_3Phases-0.1-flink-fat-jar.jar 2 2 9 0.003 8 false
+Found a yarn properties file (.yarn-properties) file, using "hydra-6.dit.uop.gr:6125" to connect to the JobManager
+02/12/2016 12:24:17:	Job execution switched to status RUNNING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (1/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (1/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (2/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (2/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (3/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (3/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (4/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (4/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (5/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (5/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (6/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (6/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (7/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (7/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (8/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (8/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (9/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (9/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (10/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (10/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (11/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (11/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (12/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (12/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (13/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (13/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (14/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (14/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (15/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (15/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (16/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (16/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (1/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (1/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (2/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (2/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (3/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (3/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (4/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (4/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (5/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (5/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (6/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (6/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (7/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (7/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (8/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (8/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (9/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (9/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (10/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (10/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (11/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (11/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (12/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (12/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (13/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (13/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (14/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (14/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (15/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (15/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (16/16) switched to SCHEDULED
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (16/16) switched to DEPLOYING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (1/16) switched to RUNNING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (4/16) switched to RUNNING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (5/16) switched to RUNNING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (9/16) switched to RUNNING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (13/16) switched to RUNNING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (1/16) switched to RUNNING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (2/16) switched to RUNNING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (3/16) switched to RUNNING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (5/16) switched to SCHEDULED
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (5/16) switched to DEPLOYING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (8/16) switched to SCHEDULED
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (8/16) switched to DEPLOYING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (2/16) switched to SCHEDULED
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (2/16) switched to DEPLOYING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (4/16) switched to SCHEDULED
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (4/16) switched to DEPLOYING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (6/16) switched to SCHEDULED
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (6/16) switched to DEPLOYING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (12/16) switched to SCHEDULED
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (12/16) switched to DEPLOYING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (12/16) switched to SCHEDULED
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (12/16) switched to DEPLOYING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (4/16) switched to SCHEDULED
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (4/16) switched to DEPLOYING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (5/16) switched to RUNNING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (2/16) switched to RUNNING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (12/16) switched to RUNNING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (12/16) switched to RUNNING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (6/16) switched to RUNNING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (4/16) switched to RUNNING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (8/16) switched to RUNNING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (4/16) switched to RUNNING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (3/16) switched to RUNNING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (11/16) switched to RUNNING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (9/16) switched to RUNNING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (12/16) switched to RUNNING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (7/16) switched to RUNNING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (11/16) switched to RUNNING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (15/16) switched to RUNNING
+02/12/2016 12:24:17:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (10/16) switched to RUNNING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (3/16) switched to SCHEDULED
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (3/16) switched to DEPLOYING
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (11/16) switched to SCHEDULED
+02/12/2016 12:24:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (11/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (7/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (7/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (2/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (2/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (5/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (5/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (9/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (9/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (14/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (14/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (13/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (13/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (7/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (4/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (6/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (15/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (14/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (12/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (16/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (8/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (6/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (8/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (14/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (16/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (13/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (10/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (2/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (7/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (5/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (3/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (9/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (11/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (14/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (13/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (1/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (1/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (6/16) switched to SCHEDULED
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (6/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (8/16) switched to SCHEDULED
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (8/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (2/16) switched to SCHEDULED
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (2/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (11/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (11/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (12/16) switched to SCHEDULED
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (12/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (4/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (13/16) switched to SCHEDULED
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (6/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (4/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (13/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (5/16) switched to SCHEDULED
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (5/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (8/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (2/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (5/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (14/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (14/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (12/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (4/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (13/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (1/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (1/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (9/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (9/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (8/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (8/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (6/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (6/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (16/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (16/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (7/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (7/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (1/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (9/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (16/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (16/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (1/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (10/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (15/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (10/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (15/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (15/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (15/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (14/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (3/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (3/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (16/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (15/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (13/16) switched to SCHEDULED
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (13/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (13/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (8/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (11/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (6/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (7/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (16/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (10/16) switched to SCHEDULED
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (10/16) switched to DEPLOYING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (15/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (10/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (3/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (14/16) switched to SCHEDULED
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (14/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (14/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (9/16) switched to SCHEDULED
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (9/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (6/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (6/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (5/16) switched to SCHEDULED
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (9/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (5/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (8/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (8/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (14/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (14/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (2/16) switched to SCHEDULED
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (3/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (2/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (3/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (6/16) switched to RUNNING
+02/12/2016 12:24:18:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (10/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (12/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (8/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (12/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (11/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (14/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (11/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (7/16) switched to SCHEDULED
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (7/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (4/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (4/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (5/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (2/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (12/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (11/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (5/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (5/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (4/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (7/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (12/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (2/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (12/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (2/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (13/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (5/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (13/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (12/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (4/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (4/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (2/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (13/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (3/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (4/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (13/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (13/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (9/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (9/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (13/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (9/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (1/16) switched to SCHEDULED
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (1/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (1/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (14/16) switched to SCHEDULED
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (16/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (14/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (16/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (1/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (1/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (10/16) switched to SCHEDULED
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (10/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (6/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (6/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (16/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (7/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (7/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (14/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (6/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (8/16) switched to SCHEDULED
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (15/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (8/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (15/16) switched to DEPLOYING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (10/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (7/16) switched to RUNNING
+02/12/2016 12:24:18:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (15/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (10/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (10/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (1/16) switched to RUNNING
+02/12/2016 12:24:18:	GroupReduce (GroupReduce at main(Phase1.java:111)) (6/16) switched to SCHEDULED
+02/12/2016 12:24:18:	GroupReduce (GroupReduce at main(Phase1.java:111)) (6/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (3/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (3/16) switched to DEPLOYING
+02/12/2016 12:24:18:	GroupReduce (GroupReduce at main(Phase1.java:110)) (6/16) switched to SCHEDULED
+02/12/2016 12:24:18:	GroupReduce (GroupReduce at main(Phase1.java:110)) (6/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (8/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (11/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (11/16) switched to DEPLOYING
+02/12/2016 12:24:18:	GroupReduce (GroupReduce at main(Phase1.java:111)) (6/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (10/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (7/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (7/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (3/16) switched to RUNNING
+02/12/2016 12:24:18:	GroupReduce (GroupReduce at main(Phase1.java:110)) (6/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (7/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (11/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (16/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (16/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (9/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (9/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (3/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (3/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (16/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (9/16) switched to RUNNING
+02/12/2016 12:24:18:	GroupReduce (GroupReduce at main(Phase1.java:111)) (11/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (3/16) switched to RUNNING
+02/12/2016 12:24:18:	GroupReduce (GroupReduce at main(Phase1.java:111)) (11/16) switched to DEPLOYING
+02/12/2016 12:24:18:	GroupReduce (GroupReduce at main(Phase1.java:111)) (11/16) switched to RUNNING
+02/12/2016 12:24:18:	GroupReduce (GroupReduce at main(Phase1.java:110)) (11/16) switched to SCHEDULED
+02/12/2016 12:24:18:	GroupReduce (GroupReduce at main(Phase1.java:110)) (11/16) switched to DEPLOYING
+02/12/2016 12:24:18:	GroupReduce (GroupReduce at main(Phase1.java:110)) (11/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (1/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (1/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (1/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (16/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (16/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (10/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (10/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (16/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (10/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (15/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (15/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (11/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (11/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (15/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (11/16) switched to RUNNING
+02/12/2016 12:24:18:	Partition (15/16) switched to SCHEDULED
+02/12/2016 12:24:18:	Partition (15/16) switched to DEPLOYING
+02/12/2016 12:24:18:	Partition (15/16) switched to RUNNING
+02/12/2016 12:24:24:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (11/16) switched to FINISHED
+02/12/2016 12:24:25:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (10/16) switched to FINISHED
+02/12/2016 12:24:25:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (15/16) switched to FINISHED
+02/12/2016 12:24:25:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (16/16) switched to FINISHED
+02/12/2016 12:24:25:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (3/16) switched to FINISHED
+02/12/2016 12:24:25:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (7/16) switched to FINISHED
+02/12/2016 12:24:26:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (9/16) switched to FINISHED
+02/12/2016 12:24:26:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (1/16) switched to FINISHED
+02/12/2016 12:24:31:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (13/16) switched to FINISHED
+02/12/2016 12:24:36:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (14/16) switched to FINISHED
+02/12/2016 12:24:38:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (15/16) switched to FINISHED
+02/12/2016 12:24:39:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (4/16) switched to FINISHED
+02/12/2016 12:24:39:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (5/16) switched to FINISHED
+02/12/2016 12:24:39:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (2/16) switched to FINISHED
+02/12/2016 12:24:40:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (6/16) switched to FINISHED
+02/12/2016 12:24:40:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (13/16) switched to FINISHED
+02/12/2016 12:24:40:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (14/16) switched to FINISHED
+02/12/2016 12:24:41:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (5/16) switched to FINISHED
+02/12/2016 12:24:42:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (8/16) switched to FINISHED
+02/12/2016 12:24:42:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (12/16) switched to FINISHED
+02/12/2016 12:24:42:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (8/16) switched to FINISHED
+02/12/2016 12:24:43:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (1/16) switched to FINISHED
+02/12/2016 12:24:43:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (9/16) switched to FINISHED
+02/12/2016 12:24:43:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (3/16) switched to FINISHED
+02/12/2016 12:24:43:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (16/16) switched to FINISHED
+02/12/2016 12:24:43:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (11/16) switched to FINISHED
+02/12/2016 12:24:43:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (2/16) switched to FINISHED
+02/12/2016 12:24:44:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (7/16) switched to FINISHED
+02/12/2016 12:24:44:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (6/16) switched to FINISHED
+02/12/2016 12:24:45:	DataSource (at main(Phase1.java:99) (org.apache.flink.api.java.io.TextInputFormat)) (10/16) switched to FINISHED
+02/12/2016 12:24:45:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (12/16) switched to FINISHED
+02/12/2016 12:24:45:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:103)) (4/16) switched to FINISHED
+02/12/2016 12:25:09:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (1/16) switched to FINISHED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (1/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (1/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (1/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (1/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (1/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (2/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (2/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (1/16) switched to RUNNING
+02/12/2016 12:25:09:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (10/16) switched to FINISHED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (2/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (2/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (2/16) switched to RUNNING
+02/12/2016 12:25:09:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (16/16) switched to FINISHED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (2/16) switched to RUNNING
+02/12/2016 12:25:09:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (15/16) switched to FINISHED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (3/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (3/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (3/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (3/16) switched to DEPLOYING
+02/12/2016 12:25:09:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (1/16) switched to FINISHED
+02/12/2016 12:25:09:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (16/16) switched to FINISHED
+02/12/2016 12:25:09:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (11/16) switched to FINISHED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (3/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (3/16) switched to RUNNING
+02/12/2016 12:25:09:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (10/16) switched to FINISHED
+02/12/2016 12:25:09:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (15/16) switched to FINISHED
+02/12/2016 12:25:09:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (8/16) switched to FINISHED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (4/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (4/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (4/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (4/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (4/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (4/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (5/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (5/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (5/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (5/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (5/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (5/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (7/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (7/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (7/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (7/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (7/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (7/16) switched to RUNNING
+02/12/2016 12:25:09:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (9/16) switched to FINISHED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (8/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (8/16) switched to DEPLOYING
+02/12/2016 12:25:09:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (11/16) switched to FINISHED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (8/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (8/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (8/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (8/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (9/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (9/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (9/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (9/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (9/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (9/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (10/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (10/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (10/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (10/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (10/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (10/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (12/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (12/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (12/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (12/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (12/16) switched to RUNNING
+02/12/2016 12:25:09:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (7/16) switched to FINISHED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (12/16) switched to RUNNING
+02/12/2016 12:25:09:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (9/16) switched to FINISHED
+02/12/2016 12:25:09:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (7/16) switched to FINISHED
+02/12/2016 12:25:09:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (3/16) switched to FINISHED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (13/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (13/16) switched to DEPLOYING
+02/12/2016 12:25:09:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (3/16) switched to FINISHED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (13/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (14/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (14/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (13/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (13/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (14/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (13/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (14/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (14/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (14/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (15/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (15/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (15/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (16/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (16/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:111)) (16/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (15/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (15/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (15/16) switched to RUNNING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (16/16) switched to SCHEDULED
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (16/16) switched to DEPLOYING
+02/12/2016 12:25:09:	GroupReduce (GroupReduce at main(Phase1.java:110)) (16/16) switched to RUNNING
+02/12/2016 12:25:10:	Partition (10/16) switched to FINISHED
+02/12/2016 12:25:10:	Partition (16/16) switched to FINISHED
+02/12/2016 12:25:10:	Partition (7/16) switched to FINISHED
+02/12/2016 12:25:10:	Partition (15/16) switched to FINISHED
+02/12/2016 12:25:10:	Partition (3/16) switched to FINISHED
+02/12/2016 12:25:10:	Partition (1/16) switched to FINISHED
+02/12/2016 12:25:10:	Partition (9/16) switched to FINISHED
+02/12/2016 12:25:10:	Partition (8/16) switched to FINISHED
+02/12/2016 12:25:10:	Partition (11/16) switched to FINISHED
+02/12/2016 12:25:10:	Partition (16/16) switched to FINISHED
+02/12/2016 12:25:10:	Partition (15/16) switched to FINISHED
+02/12/2016 12:25:10:	Partition (7/16) switched to FINISHED
+02/12/2016 12:25:10:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (8/16) switched to FINISHED
+02/12/2016 12:25:10:	Partition (3/16) switched to FINISHED
+02/12/2016 12:25:10:	Partition (1/16) switched to FINISHED
+02/12/2016 12:25:11:	Partition (9/16) switched to FINISHED
+02/12/2016 12:25:11:	Partition (11/16) switched to FINISHED
+02/12/2016 12:25:11:	Partition (10/16) switched to FINISHED
+02/12/2016 12:25:12:	Partition (8/16) switched to FINISHED
+02/12/2016 12:25:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (2/16) switched to FINISHED
+02/12/2016 12:25:17:	Partition (2/16) switched to FINISHED
+02/12/2016 12:25:17:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (2/16) switched to FINISHED
+02/12/2016 12:25:17:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (13/16) switched to FINISHED
+02/12/2016 12:25:17:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (13/16) switched to FINISHED
+02/12/2016 12:25:17:	Partition (13/16) switched to FINISHED
+02/12/2016 12:25:17:	Partition (2/16) switched to FINISHED
+02/12/2016 12:25:18:	Partition (13/16) switched to FINISHED
+02/12/2016 12:25:19:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (8/16) switched to FINISHED
+02/12/2016 12:25:21:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (6/16) switched to FINISHED
+02/12/2016 12:25:22:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (5/16) switched to FINISHED
+02/12/2016 12:25:22:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (7/16) switched to FINISHED
+02/12/2016 12:25:25:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (16/16) switched to FINISHED
+02/12/2016 12:25:26:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (15/16) switched to FINISHED
+02/12/2016 12:25:26:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (10/16) switched to FINISHED
+02/12/2016 12:25:26:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (12/16) switched to FINISHED
+02/12/2016 12:25:26:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (13/16) switched to FINISHED
+02/12/2016 12:25:27:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (14/16) switched to FINISHED
+02/12/2016 12:25:27:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (11/16) switched to FINISHED
+02/12/2016 12:25:27:	DataSource (at main(Phase1.java:100) (org.apache.flink.api.java.io.TextInputFormat)) (9/16) switched to FINISHED
+02/12/2016 12:25:28:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (14/16) switched to FINISHED
+02/12/2016 12:25:28:	DataSink(TextOutputFormat (hdfs://localhost:9000/user/chgeorgakidis/Results_Phase1) - UTF-8) (14/16) switched to FINISHED
+02/12/2016 12:25:28:	Partition (14/16) switched to FINISHED
+02/12/2016 12:25:28:	Partition (14/16) switched to FINISHED
+02/12/2016 12:25:28:	CHAIN Partition -> FlatMap (FlatMap at main(Phase1.java:104)) (12/16) switched to FINISHED
+02/12/2016 12:25:28:	Partition (12/16) switched to FINISHED
+02/12/2016 12:25:28:	Partition (12/16) switched to FINISHED
+
+							ArrayList<Integer> ai = new ArrayList<Integer>(conf.getDimension());
+							for (int i = 0; i < conf.getDimension(); i++) {
+								ai.add(coord2[i]);
+							}
+							coordLRUCache.put(zval2, ai);
+						} else {
+							// int[] coord2 = cacheCoord2.toArray();
+							coord2 = new int[conf.getDimension()];
+							for (int i = 0; i < conf.getDimension(); i++)
+								coord2[i] = cachedCoord2.get(i);
+						}
+
+						float dist = (float) 0.0;
+						for (int i = 0; i < conf.getDimension(); i++)
+							dist += (float) ((coord[i] - coord2[i]) * (coord[i] - coord2[i]));
+
+						KnnRecord kr = new KnnRecord(rid2, (float) Math.sqrt(dist));
+						knnListSorted.add(kr);
+					}
+				}
+
+				Collections.sort(knnListSorted, krc);
+				KnnRecord tmp = knnListSorted.get(0);
+				for (int i = 0; i < conf.getKnn(); i++) {
+					KnnRecord kr;
+					try {
+						kr = knnListSorted.get(i);
+					} catch (IndexOutOfBoundsException e) {
+						kr = tmp;
+					}
+
+					result.add(new Tuple4<String, String, String, String>(rid, kr.getRid().substring(0, 25), 
+								Float.toString(kr.getDist()), kr.getRid().substring(26)));
+				}
+			}
+			brForR.close();
+
+		}
+		// ...else store them locally and perform binary search
+		else {
+			// TODO Binary search in file
+			// File Rsorted = new File("R_local" + entry.getFourth() +
+			// "_sorted");
+			// File Ssorted = new File("S_local" + entry.getFourth() +
+			// "_sorted");
+
+			// Sort the records in the files
+			/** Library from https://code.google.com/p/externalsortinginjava/ **/
+			// ExternalSort.sort(R, Rsorted);
+			// ExternalSort.sort(S, Ssorted);
+
+		}
+
+		R.delete();
+		S.delete();
+		return result;
+	}
+
+	private class ValueComparator implements Comparator<String> {
+
+        	@Override
+            	public int compare(String w1, String w2) {
+                    	return w1.compareTo(w2);
+            	}
+	}
+
+	class KnnRecordComparator implements Comparator<KnnRecord>{
+		public int compare(KnnRecord o1, KnnRecord o2) {
+			int ret = 0;
+			float dist = o1.getDist() - o2.getDist();
+
+			if (dist > 0)
+				ret = 1;
+			else
+				ret = -1;
+			return -ret;
+		}
+	}
+}
+
